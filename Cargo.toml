@@ -1,37 +1,66 @@
 [package]
 name = "unbinder"
-version = "0.1.5"
+version = "0.1.7"
 edition = "2021"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = true
+
+[package.metadata.wasm-pack]
+name = "unbinder"
+
+# ── core ──────────────────────────────────────────────
 [dependencies]
-rustc-hash = "2.1.1"
-serde = { version = "1.0.219", features = ["derive"] }
-serde_json = "1.0.140"
-console_error_panic_hook = { version = "0.1.7", optional = true }
-web-sys = { version = "0.3.77", optional = true, features = ["console"] }
-serde-wasm-bindgen = "0.6.5"
-js-sys = "0.3.77"
+rustc-hash = "2.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+cfg-if = "1.0.1"
 
-[dependencies.wasm-bindgen]
-version = "0.2.100"
-features = ["serde-serialize"]
+# ── wasm glue (conditional) ──────────────────────────────
+serde-wasm-bindgen = { version = "0.6", optional = true }
+js-sys = { version = "0.3", optional = true }
+web-sys = { version = "0.3", optional = true, features = [
+    "console",
+    "Performance",
+] }
+wasm-bindgen = { version = "0.2", optional = true, features = [
+    "serde-serialize",
+] }
+wasm-bindgen-rayon = { version = "1.3", optional = true }
+console_error_panic_hook = { version = "0.1", optional = true }
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wee_alloc = { version = "0.4", optional = true }
+
+# ── features ──────────────────────────────────────────
 [features]
-default = ["console_error_panic_hook", "console_log"]
-console_log = ["web-sys"]
+default = ["std"]
+std = []
+wasm = [
+    "dep:wasm-bindgen",
+    "dep:js-sys",
+    "dep:web-sys",
+    "dep:serde-wasm-bindgen",
+]
+wee_alloc = ["dep:wee_alloc"]
+console_log = ["wasm", "dep:web-sys"] # Fixed: use dep:web-sys
+console_error_panic_hook = ["dep:console_error_panic_hook"]
+text-interface = ["wasm"]
+parallel = [
+    "std",
+    "dep:wasm-bindgen-rayon",
+    "wasm",
+] # Fixed: use dep:wasm-bindgen-rayon
+dev = [
+    "dep:console_error_panic_hook",
+    "console_log",
+] # Fixed: use dep:console_error_panic_hook
 
-dev = ["console_error_panic_hook", "console_log"]
-
+# ── release profile ───────────────────────────────────
 [profile.release]
-# Optimize for size in release builds
 opt-level = "s"
 lto = true
-debug = false
 panic = "abort"
-
-# Enable aggressive optimizations for WASM
-[profile.release.package."*"]
-opt-level = "s"
