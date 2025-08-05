@@ -1,4 +1,68 @@
-//! JSON-Schema dereferencer: `no_std` core + optional WASM front-end.
+//! # Unbinder - JSON Schema Dereferencer
+//! 
+//! A high-performance JSON Schema dereferencer that resolves `$ref` pointers,
+//! making schemas self-contained by replacing references with their actual content.
+//! 
+//! ## Features
+//! 
+//! - **Fast**: Written in Rust with performance optimizations
+//! - **No-std support**: Can be used in embedded environments
+//! - **WebAssembly support**: Compile to WASM for browser/Node.js usage
+//! - **Circular reference handling**: Detects and handles circular references gracefully
+//! - **Zero-copy where possible**: Minimizes memory allocations
+//! 
+//! ## Quick Start
+//! 
+//! ```rust
+//! use unbinder::{dereference_schema, Options};
+//! use serde_json::json;
+//! 
+//! # fn main() -> Result<(), unbinder::Error> {
+//! let mut schema = json!({
+//!     "type": "object",
+//!     "properties": {
+//!         "name": { "$ref": "#/definitions/name" }
+//!     },
+//!     "definitions": {
+//!         "name": { "type": "string" }
+//!     }
+//! });
+//! 
+//! dereference_schema(&mut schema, Options::default())?;
+//! # Ok(())
+//! # }
+//! ```
+//! 
+//! ## Circular Reference Handling
+//! 
+//! ```rust
+//! use unbinder::{dereference_schema, Options};
+//! use serde_json::json;
+//! 
+//! # fn main() -> Result<(), unbinder::Error> {
+//! let mut schema = json!({
+//!     "definitions": {
+//!         "node": {
+//!             "type": "object",
+//!             "properties": {
+//!                 "children": {
+//!                     "type": "array",
+//!                     "items": { "$ref": "#/definitions/node" }
+//!                 }
+//!             }
+//!         }
+//!     }
+//! });
+//! 
+//! let opts = Options {
+//!     resolve_external: false,
+//!     on_circular: Some(|path| eprintln!("Circular reference: {}", path)),
+//! };
+//! 
+//! dereference_schema(&mut schema, opts)?;
+//! # Ok(())
+//! # }
+//! ```
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -31,6 +95,11 @@ static ALLOC: wee_alloc::WeeAlloc = wee_alloc::WeeAlloc::INIT;
 //  CORE  (no_std + alloc)  — all real work happens here
 // ────────────────────────────────────────────────────────────────────────
 //
+/// Core dereferencing implementation.
+/// 
+/// This module contains the main dereferencing logic that works in `no_std` environments
+/// with only `alloc` available. It uses efficient data structures and algorithms to
+/// resolve JSON references while handling circular dependencies.
 mod core {
     use super::*;
     use rustc_hash::{FxHashMap, FxHashSet};
@@ -43,11 +112,39 @@ mod core {
     use std::sync::Arc as SharedPtr;
 
     // ── public types ───────────────────────────────────────────
+    /// Error type for dereferencing operations.
+    /// 
+    /// Currently uses `String` for maximum flexibility in `no_std` environments.
     pub type Error = String;
 
+    /// Configuration options for the dereferencer.
+    /// 
+    /// # Examples
+    /// 
+    /// ```rust
+    /// use unbinder::Options;
+    /// 
+    /// // Default options
+    /// let opts = Options::default();
+    /// 
+    /// // Custom options with circular reference logging
+    /// let opts = Options {
+    ///     resolve_external: false,
+    ///     on_circular: Some(|path| println!("Circular ref: {}", path)),
+    /// };
+    /// ```
     #[derive(Clone, Default)]
     pub struct Options {
+        /// Whether to resolve external references (currently not supported).
+        /// 
+        /// External references are those that don't start with '#'.
+        /// Setting this to `true` will result in an error for external refs.
         pub resolve_external: bool,
+        
+        /// Callback function invoked when circular references are detected.
+        /// 
+        /// The callback receives the reference path that forms a cycle.
+        /// Circular references are replaced with `null` in the output.
         pub on_circular: Option<fn(&str)>,
     }
 
@@ -82,6 +179,59 @@ mod core {
     }
 
     // ── public entry points ────────────────────────────────────
+    /// Dereferences all `$ref` pointers in a JSON Schema document.
+    /// 
+    /// This function modifies the input `Value` in-place, replacing all `$ref` objects
+    /// with their referenced content. The dereferencing process handles nested references
+    /// and detects circular dependencies.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `root` - The JSON value to dereference (modified in-place)
+    /// * `opts` - Configuration options for the dereferencing process
+    /// 
+    /// # Returns
+    /// 
+    /// * `Ok(())` if dereferencing completed successfully
+    /// * `Err(Error)` if an error occurred (e.g., invalid reference, external reference)
+    /// 
+    /// # Examples
+    /// 
+    /// ```rust
+    /// use unbinder::{dereference_schema, Options};
+    /// use serde_json::json;
+    /// 
+    /// # fn main() -> Result<(), unbinder::Error> {
+    /// let mut schema = json!({
+    ///     "type": "object",
+    ///     "properties": {
+    ///         "user": { "$ref": "#/definitions/User" }
+    ///     },
+    ///     "definitions": {
+    ///         "User": {
+    ///             "type": "object",
+    ///             "properties": {
+    ///                 "name": { "type": "string" }
+    ///             }
+    ///         }
+    ///     }
+    /// });
+    /// 
+    /// dereference_schema(&mut schema, Options::default())?;
+    /// 
+    /// // The $ref has been replaced with the actual User definition
+    /// assert_eq!(
+    ///     schema["properties"]["user"]["type"],
+    ///     "object"
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    /// 
+    /// # Safety
+    /// 
+    /// This function uses unsafe code internally for performance optimization,
+    /// but the public API is safe to use.
     pub fn dereference_schema(root: &mut Value, opts: Options) -> Result<(), Error> {
         let mut cache = Cache::default();
         let raw = root as *const Value;
@@ -89,6 +239,48 @@ mod core {
         Ok(())
     }
 
+    /// Counts the number of objects, arrays, and references in a JSON value.
+    /// 
+    /// This function recursively traverses the JSON structure and counts:
+    /// - Objects (JSON objects/maps)
+    /// - Arrays (JSON arrays)
+    /// - References (objects containing a "$ref" key)
+    /// 
+    /// # Arguments
+    /// 
+    /// * `v` - The JSON value to analyze
+    /// 
+    /// # Returns
+    /// 
+    /// A tuple of `(objects, arrays, refs)` where:
+    /// - `objects` is the total number of JSON objects
+    /// - `arrays` is the total number of JSON arrays
+    /// - `refs` is the total number of `$ref` references
+    /// 
+    /// # Examples
+    /// 
+    /// ```rust
+    /// use unbinder::count;
+    /// use serde_json::json;
+    /// 
+    /// let schema = json!({
+    ///     "type": "object",
+    ///     "properties": {
+    ///         "items": {
+    ///             "type": "array",
+    ///             "items": { "$ref": "#/definitions/Item" }
+    ///         }
+    ///     },
+    ///     "definitions": {
+    ///         "Item": { "type": "string" }
+    ///     }
+    /// });
+    /// 
+    /// let (objects, arrays, refs) = count(&schema);
+    /// assert_eq!(objects, 5);  // root + properties + items + items.items + definitions + Item
+    /// assert_eq!(arrays, 1);   // items array
+    /// assert_eq!(refs, 1);     // one $ref
+    /// ```
     pub fn count(v: &Value) -> (usize, usize, usize) {
         match v {
             Value::Object(m) => {
@@ -242,6 +434,31 @@ pub use core::{count, dereference_schema, Error, Options};
 //  WASM front-end  (only when compiling to wasm32)
 // ────────────────────────────────────────────────────────────────────────
 //
+/// WebAssembly bindings for browser and Node.js usage.
+/// 
+/// This module provides JavaScript-friendly APIs when compiling to WebAssembly.
+/// It includes automatic serialization/deserialization and error handling suitable
+/// for JavaScript environments.
+/// 
+/// # JavaScript Usage
+/// 
+/// ```javascript
+/// import init, { dereferenceSchema, Options } from 'unbinder';
+/// 
+/// await init(); // Initialize WASM module
+/// 
+/// const schema = {
+///   properties: {
+///     user: { $ref: "#/definitions/User" }
+///   },
+///   definitions: {
+///     User: { type: "object" }
+///   }
+/// };
+/// 
+/// const options = new Options();
+/// const result = dereferenceSchema(schema, options);
+/// ```
 #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
 mod wasm_front {
     use super::*;
@@ -266,15 +483,32 @@ mod wasm_front {
     }
 
     // ── JS-friendly error wrapper ───────────────────────────────
+    /// JavaScript-compatible error type.
+    /// 
+    /// Wraps Rust errors in a format that JavaScript can understand,
+    /// with a `message` property accessible from JS.
     #[wasm_bindgen]
     pub struct WasmError(String);
+    
     impl<E: fmt::Display> From<E> for WasmError {
         fn from(e: E) -> Self {
             Self(e.to_string())
         }
     }
+    
     #[wasm_bindgen]
     impl WasmError {
+        /// Gets the error message.
+        /// 
+        /// # JavaScript Example
+        /// 
+        /// ```javascript
+        /// try {
+        ///   dereferenceSchema(schema);
+        /// } catch (error) {
+        ///   console.error(error.message);
+        /// }
+        /// ```
         #[wasm_bindgen(getter)]
         pub fn message(&self) -> String {
             self.0.clone()
@@ -282,22 +516,42 @@ mod wasm_front {
     }
 
     // ── options object passed from JS ───────────────────────────
+    /// Configuration options for the WebAssembly dereferencer.
+    /// 
+    /// # JavaScript Example
+    /// 
+    /// ```javascript
+    /// const options = new Options();
+    /// options.setLogCircularRefs(true);
+    /// 
+    /// const result = dereferenceSchema(schema, options);
+    /// ```
     #[wasm_bindgen]
     #[derive(Clone, Default)]
     pub struct Options {
         resolve_external: bool,
         log_circular: bool,
     }
+    
     #[wasm_bindgen]
     impl Options {
+        /// Creates a new Options instance with default settings.
         #[wasm_bindgen(constructor)]
         pub fn new() -> Self {
             Self::default()
         }
+        
+        /// Sets whether to resolve external references.
+        /// 
+        /// Note: External references are not currently supported and will return an error.
         #[wasm_bindgen(setter)]
         pub fn set_resolve_external(&mut self, v: bool) {
             self.resolve_external = v;
         }
+        
+        /// Sets whether to log circular references to the console.
+        /// 
+        /// When enabled, circular reference paths will be logged using `console.log()`.
         #[wasm_bindgen(setter, js_name = setLogCircularRefs)]
         pub fn set_log_circular(&mut self, v: bool) {
             self.log_circular = v;
@@ -305,6 +559,40 @@ mod wasm_front {
     }
 
     // ── main wasm entry (JsValue → JsValue) ─────────────────────
+    /// Dereferences a JSON Schema from JavaScript.
+    /// 
+    /// This is the main entry point for JavaScript/TypeScript usage.
+    /// It accepts a JavaScript object and returns the dereferenced result.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `value` - The JSON Schema as a JavaScript object
+    /// * `opts` - Optional configuration options
+    /// 
+    /// # Returns
+    /// 
+    /// The dereferenced schema as a JavaScript object, or a `WasmError` if dereferencing fails.
+    /// 
+    /// # JavaScript Example
+    /// 
+    /// ```javascript
+    /// import init, { dereferenceSchema, Options } from 'unbinder';
+    /// 
+    /// await init();
+    /// 
+    /// const schema = {
+    ///   type: "object",
+    ///   properties: {
+    ///     user: { $ref: "#/definitions/User" }
+    ///   },
+    ///   definitions: {
+    ///     User: { type: "object" }
+    ///   }
+    /// };
+    /// 
+    /// const result = dereferenceSchema(schema);
+    /// console.log(result.properties.user.type); // "object"
+    /// ```
     #[wasm_bindgen(js_name = dereferenceSchema)]
     pub fn deref_js(value: &JsValue, opts: Option<Options>) -> Result<JsValue, WasmError> {
         use serde_wasm_bindgen::{Deserializer, Serializer};
@@ -325,6 +613,30 @@ mod wasm_front {
     }
 
     // optional string interface
+    /// Dereferences a JSON Schema from a string (text interface).
+    /// 
+    /// This alternative API accepts and returns JSON as strings instead of objects.
+    /// Useful for environments where string manipulation is preferred.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `s` - The JSON Schema as a string
+    /// 
+    /// # Returns
+    /// 
+    /// The dereferenced schema as a JSON string, or a `WasmError` if parsing/dereferencing fails.
+    /// 
+    /// # JavaScript Example
+    /// 
+    /// ```javascript
+    /// const schemaStr = JSON.stringify({
+    ///   properties: { user: { $ref: "#/definitions/User" } },
+    ///   definitions: { User: { type: "object" } }
+    /// });
+    /// 
+    /// const resultStr = dereferenceSchemaText(schemaStr);
+    /// const result = JSON.parse(resultStr);
+    /// ```
     #[cfg(feature = "text-interface")]
     #[wasm_bindgen(js_name = dereferenceSchemaText)]
     pub fn deref_text(s: &str) -> Result<String, WasmError> {
@@ -334,6 +646,28 @@ mod wasm_front {
     }
 
     // statistics helper
+    /// Analyzes a JSON Schema and returns size statistics.
+    /// 
+    /// Useful for understanding the complexity of a schema before dereferencing.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `s` - The JSON Schema as a string
+    /// 
+    /// # Returns
+    /// 
+    /// A JavaScript object with the following properties:
+    /// - `bytes`: Size of the input string in bytes
+    /// - `objects`: Number of JSON objects in the schema
+    /// - `arrays`: Number of JSON arrays in the schema
+    /// - `refs`: Number of `$ref` references in the schema
+    /// 
+    /// # JavaScript Example
+    /// 
+    /// ```javascript
+    /// const stats = estimateSchemaSize(JSON.stringify(schema));
+    /// console.log(`Schema has ${stats.refs} references`);
+    /// ```
     #[wasm_bindgen(js_name = estimateSchemaSize)]
     pub fn size(s: &str) -> Result<JsValue, WasmError> {
         let v: serde_json::Value = serde_json::from_str(s)?;
@@ -346,12 +680,28 @@ mod wasm_front {
         ]))
     }
 
+    /// Gets the current WebAssembly memory usage information.
+    /// 
+    /// Returns memory statistics if available, or an error object if not supported.
+    /// 
+    /// # JavaScript Example
+    /// 
+    /// ```javascript
+    /// const memInfo = getMemoryUsage();
+    /// if (!memInfo.error) {
+    ///   console.log('Memory usage:', memInfo);
+    /// }
+    /// ```
     #[wasm_bindgen(js_name = getMemoryUsage)]
     pub fn mem() -> JsValue {
         std::panic::catch_unwind(get_mem)
             .unwrap_or_else(|_| js_obj(&[("error", "not defined".into())]))
     }
 
+    /// WASM module initialization function.
+    /// 
+    /// This function is automatically called when the WASM module is loaded.
+    /// It sets up console error panic hooks (in debug mode) and logs initialization.
     #[wasm_bindgen(start)]
     pub fn init() {
         debug_log("dereferencer wasm loaded");
